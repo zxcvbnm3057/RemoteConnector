@@ -54,8 +54,8 @@ namespace
     constexpr std::chrono::seconds kUdpSweepInterval{5};
 
     // UDP hole punching constants
-    constexpr std::chrono::seconds kHeartbeatInterval{20};
-    constexpr std::chrono::seconds kMaxIdleTime{40}; // 2 * heartbeat interval
+    constexpr std::chrono::seconds kHeartbeatInterval{5};
+    constexpr std::chrono::seconds kMaxIdleTime{60};
     constexpr std::chrono::milliseconds kHandshakeInterval{1000};
     constexpr int kMaxHandshakeRetries = 30;
     constexpr std::chrono::seconds kReconnectDelay{5}; // Delay before reconnection attempt
@@ -1294,10 +1294,10 @@ namespace
         // Close and recreate client socket with mutex protection
         SOCKET newSocket = INVALID_SOCKET;
         uint16_t newPort = 0;
-        
+
         {
             std::lock_guard<std::mutex> lock(tunnel->socketMutex);
-            
+
             // Close old socket
             if (tunnel->clientSocket != INVALID_SOCKET)
             {
@@ -1305,7 +1305,7 @@ namespace
                 tunnel->clientSocket = INVALID_SOCKET;
             }
         }
-        
+
         // Create new socket outside the lock to avoid holding it too long
         newSocket = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
         if (newSocket == INVALID_SOCKET)
@@ -1360,50 +1360,50 @@ namespace
         {
             // Attempt connection
             logMessage(LogLevel::Info, tunnel->tag, "Attempting UDP hole punching connection");
-            
+
             if (performUdpHolePunching(tunnel, serverEndpoint))
             {
                 logMessage(LogLevel::Info, tunnel->tag, "UDP hole punching connection established");
-                
+
                 // Wait for connection to fail (connected will be set to false on timeout or error)
                 // Keep checking every second to allow quick response to shutdown
                 while (tunnel->running.load(std::memory_order_acquire) && tunnel->connected.load(std::memory_order_acquire))
                 {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
                 }
-                
+
                 if (!tunnel->running.load(std::memory_order_acquire))
                 {
                     // Shutdown requested, exit
                     break;
                 }
-                
+
                 logMessage(LogLevel::Warn, tunnel->tag, "UDP hole punching connection lost, will retry");
             }
             else
             {
                 logMessage(LogLevel::Error, tunnel->tag, "UDP hole punching connection failed, will retry");
             }
-            
+
             // Wait before reconnecting
             logMessage(LogLevel::Info, tunnel->tag, "Waiting " + std::to_string(kReconnectDelay.count()) + " seconds before reconnection");
-            
+
             auto waitStart = Clock::now();
-            while (tunnel->running.load(std::memory_order_acquire) && 
+            while (tunnel->running.load(std::memory_order_acquire) &&
                    (Clock::now() - waitStart) < kReconnectDelay)
             {
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
-            
+
             if (!tunnel->running.load(std::memory_order_acquire))
             {
                 // Shutdown requested during wait, exit
                 break;
             }
-            
+
             // Reset tunnel for reconnection
             resetUdpHolePunchTunnelForReconnect(tunnel);
-            
+
             if (tunnel->clientSocket == INVALID_SOCKET)
             {
                 // Failed to reset, cannot retry
@@ -1412,7 +1412,7 @@ namespace
                 break;
             }
         }
-        
+
         logMessage(LogLevel::Info, tunnel->tag, "UDP hole punching connection manager exited");
     }
 
