@@ -483,22 +483,81 @@ namespace
 
         logMessage(LogLevel::Info, remoteTag, "Starting UDP hole punching on port " + std::to_string(context.serverPort));
 
-        // Start sending handshake packets to client
-        auto handshakeStart = std::chrono::steady_clock::now();
+        // Set socket timeout for receiving
+        DWORD timeoutMs = 3000;
+        setSocketTimeout(context.udpSocket, SO_RCVTIMEO, timeoutMs);
+
+        // Start sending handshake packets to client in a separate thread
+        // This allows simultaneous sending and receiving for proper hole punching
+        std::thread handshakeSender([&context, remoteTag]() {
+            auto handshakeStart = std::chrono::steady_clock::now();
+            while (context.running.load(std::memory_order_acquire) && !context.connected.load(std::memory_order_acquire))
+            {
+                if ((std::chrono::steady_clock::now() - handshakeStart) > kHolePunchTimeout)
+                {
+                    logMessage(LogLevel::Warn, remoteTag, "UDP hole punching timeout");
+                    context.running.store(false, std::memory_order_release);
+                    break;
+                }
+
+                sendUdpHolePunchPacket(context.udpSocket,
+                                      reinterpret_cast<sockaddr*>(&context.clientAddr),
+                                      context.clientAddrLen,
+                                      UdpHolePunchPacketType::HANDSHAKE);
+
+                std::this_thread::sleep_for(kHandshakeInterval);
+            }
+        });
+
+        // Receive loop for handshake - runs simultaneously with sender
+        std::vector<char> buffer(kMaxPayloadSize);
         while (context.running.load(std::memory_order_acquire) && !context.connected.load(std::memory_order_acquire))
         {
-            if ((std::chrono::steady_clock::now() - handshakeStart) > kHolePunchTimeout)
+            sockaddr_storage fromAddr{};
+            int fromLen = sizeof(fromAddr);
+            
+            int received = recvfrom(context.udpSocket, buffer.data(), static_cast<int>(buffer.size()), 0,
+                                   reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
+            
+            if (received == SOCKET_ERROR)
             {
-                logMessage(LogLevel::Warn, remoteTag, "UDP hole punching timeout");
+                int err = WSAGetLastError();
+                if (err == WSAETIMEDOUT)
+                {
+                    continue; // Keep waiting for handshake
+                }
+                if (context.running.load(std::memory_order_acquire))
+                {
+                    logMessage(LogLevel::Warn, remoteTag, "UDP recv failed during handshake, WSA error=" + std::to_string(err));
+                }
                 break;
             }
 
-            sendUdpHolePunchPacket(context.udpSocket,
-                                  reinterpret_cast<sockaddr*>(&context.clientAddr),
-                                  context.clientAddrLen,
-                                  UdpHolePunchPacketType::HANDSHAKE);
+            context.lastActivity = std::chrono::steady_clock::now();
 
-            std::this_thread::sleep_for(kHandshakeInterval);
+            // Check if this is a handshake packet from client
+            if (received >= static_cast<int>(sizeof(UdpHolePunchPacket)))
+            {
+                UdpHolePunchPacket* packet = reinterpret_cast<UdpHolePunchPacket*>(buffer.data());
+                if (packet->type == UdpHolePunchPacketType::HANDSHAKE)
+                {
+                    logMessage(LogLevel::Info, remoteTag, "UDP hole punching connected");
+                    context.connected.store(true, std::memory_order_release);
+                    
+                    // Send ACK
+                    sendUdpHolePunchPacket(context.udpSocket,
+                                          reinterpret_cast<sockaddr*>(&fromAddr),
+                                          fromLen,
+                                          UdpHolePunchPacketType::ACK);
+                    break; // Exit handshake receive loop
+                }
+            }
+        }
+
+        // Wait for sender thread to complete
+        if (handshakeSender.joinable())
+        {
+            handshakeSender.join();
         }
 
         if (!context.connected.load(std::memory_order_acquire))
@@ -532,10 +591,8 @@ namespace
 
         logMessage(LogLevel::Info, remoteTag, "UDP hole punch tunnel established to target 127.0.0.1:" + std::to_string(targetPort));
 
-        // Set timeouts
-        DWORD timeoutMs = 3000;
-        setSocketTimeout(context.udpSocket, SO_RCVTIMEO, timeoutMs);
-        setSocketTimeout(targetSocket, SO_RCVTIMEO, timeoutMs);
+        // Socket timeout already set during handshake
+        setSocketTimeout(targetSocket, SO_RCVTIMEO, 3000);
 
         // Start forwarding thread for target -> client
         std::thread targetToClient([&context, targetSocket]() {
@@ -577,7 +634,8 @@ namespace
         });
 
         // Main loop: client -> target
-        std::vector<char> buffer(kMaxPayloadSize);
+        buffer.clear();
+        buffer.resize(kMaxPayloadSize);
         while (context.running.load(std::memory_order_acquire))
         {
             sockaddr_storage fromAddr{};
@@ -609,24 +667,6 @@ namespace
 
             context.lastActivity = std::chrono::steady_clock::now();
 
-            // Check if this is a handshake packet from client
-            if (received >= static_cast<int>(sizeof(UdpHolePunchPacket)) && !context.connected.load(std::memory_order_acquire))
-            {
-                UdpHolePunchPacket* packet = reinterpret_cast<UdpHolePunchPacket*>(buffer.data());
-                if (packet->type == UdpHolePunchPacketType::HANDSHAKE)
-                {
-                    logMessage(LogLevel::Info, remoteTag, "UDP hole punching connected");
-                    context.connected.store(true, std::memory_order_release);
-                    
-                    // Send ACK
-                    sendUdpHolePunchPacket(context.udpSocket,
-                                          reinterpret_cast<sockaddr*>(&fromAddr),
-                                          fromLen,
-                                          UdpHolePunchPacketType::ACK);
-                    continue;
-                }
-            }
-
             // Check for heartbeat
             if (received >= static_cast<int>(sizeof(UdpHolePunchPacket)))
             {
@@ -643,14 +683,11 @@ namespace
             }
 
             // Forward data to target
-            if (context.connected.load(std::memory_order_acquire))
+            int sent = send(targetSocket, buffer.data(), received, 0);
+            if (sent == SOCKET_ERROR)
             {
-                int sent = send(targetSocket, buffer.data(), received, 0);
-                if (sent == SOCKET_ERROR)
-                {
-                    logMessage(LogLevel::Warn, remoteTag, "Failed to forward data to target");
-                    break;
-                }
+                logMessage(LogLevel::Warn, remoteTag, "Failed to forward data to target");
+                break;
             }
         }
 
