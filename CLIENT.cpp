@@ -120,6 +120,7 @@ namespace
     {
         SOCKET clientSocket = INVALID_SOCKET;   // 客户端随机端口socket
         SOCKET listenSocket = INVALID_SOCKET;   // 监听端口socket
+        uint16_t listenPort = 0;                // 本地监听端口
         uint16_t clientPort = 0;                // 客户端随机端口
         uint16_t serverPort = 0;                // 服务端端口
         sockaddr_storage peerAddr{};            // 服务端地址
