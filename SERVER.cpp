@@ -529,6 +529,7 @@ namespace
                 {
                     logMessage(LogLevel::Warn, remoteTag, "UDP recv failed during handshake, WSA error=" + std::to_string(err));
                 }
+                context.running.store(false, std::memory_order_release);
                 break;
             }
 
@@ -555,11 +556,12 @@ namespace
             }
         }
 
-        // Wait for sender thread to complete
-        // if (handshakeSender.joinable())
-        // {
-        //     handshakeSender.join();
-        // }
+        // Stop the sender thread and wait for it to complete
+        context.running.store(false, std::memory_order_release);
+        if (handshakeSender.joinable())
+        {
+            handshakeSender.join();
+        }
 
         if (!context.connected.load(std::memory_order_acquire))
         {

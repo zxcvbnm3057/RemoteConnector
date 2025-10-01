@@ -58,6 +58,7 @@ namespace
     constexpr std::chrono::seconds kMaxIdleTime{40}; // 2 * heartbeat interval
     constexpr std::chrono::milliseconds kHandshakeInterval{1000};
     constexpr int kMaxHandshakeRetries = 30;
+    constexpr std::chrono::seconds kReconnectDelay{5}; // Delay before reconnection attempt
 
     enum class LogLevel
     {
@@ -136,6 +137,7 @@ namespace
         sockaddr_storage lastLocalClient{};
         int lastLocalClientLen = 0;
         std::mutex clientMutex;
+        std::mutex socketMutex; // Protects clientSocket during reconnection
     };
 
     struct UdpHolePunchListenerState
@@ -1073,12 +1075,18 @@ namespace
         int retries = 0;
         while (tunnel->running.load(std::memory_order_acquire) && !tunnel->connected.load(std::memory_order_acquire) && retries < kMaxHandshakeRetries)
         {
-            if (!sendUdpHolePunchPacket(tunnel->clientSocket,
-                                        reinterpret_cast<sockaddr *>(&tunnel->serverAddr),
-                                        tunnel->serverAddrLen,
-                                        UdpHolePunchPacketType::HANDSHAKE))
             {
-                logMessage(LogLevel::Warn, tunnel->tag, "Failed to send handshake packet");
+                std::lock_guard<std::mutex> lock(tunnel->socketMutex);
+                if (tunnel->clientSocket != INVALID_SOCKET)
+                {
+                    if (!sendUdpHolePunchPacket(tunnel->clientSocket,
+                                                reinterpret_cast<sockaddr *>(&tunnel->serverAddr),
+                                                tunnel->serverAddrLen,
+                                                UdpHolePunchPacketType::HANDSHAKE))
+                    {
+                        logMessage(LogLevel::Warn, tunnel->tag, "Failed to send handshake packet");
+                    }
+                }
             }
 
             // Update activity time to prevent idle timeout during handshake
@@ -1112,18 +1120,24 @@ namespace
             auto now = Clock::now();
             if ((now - tunnel->lastActivity) > kMaxIdleTime)
             {
-                logMessage(LogLevel::Warn, tunnel->tag, "UDP hole punch tunnel idle timeout");
-                tunnel->running.store(false, std::memory_order_release);
+                logMessage(LogLevel::Warn, tunnel->tag, "UDP hole punch tunnel idle timeout, will trigger reconnection");
+                tunnel->connected.store(false, std::memory_order_release);
                 break;
             }
 
             // Send heartbeat
-            if (!sendUdpHolePunchPacket(tunnel->clientSocket,
-                                        reinterpret_cast<sockaddr *>(&tunnel->serverAddr),
-                                        tunnel->serverAddrLen,
-                                        UdpHolePunchPacketType::HEARTBEAT))
             {
-                logMessage(LogLevel::Warn, tunnel->tag, "Failed to send heartbeat");
+                std::lock_guard<std::mutex> lock(tunnel->socketMutex);
+                if (tunnel->clientSocket != INVALID_SOCKET)
+                {
+                    if (!sendUdpHolePunchPacket(tunnel->clientSocket,
+                                                reinterpret_cast<sockaddr *>(&tunnel->serverAddr),
+                                                tunnel->serverAddrLen,
+                                                UdpHolePunchPacketType::HEARTBEAT))
+                    {
+                        logMessage(LogLevel::Warn, tunnel->tag, "Failed to send heartbeat");
+                    }
+                }
             }
         }
     }
@@ -1136,7 +1150,20 @@ namespace
             sockaddr_storage fromAddr{};
             int fromLen = sizeof(fromAddr);
 
-            int received = recvfrom(tunnel->clientSocket, buffer.data(), static_cast<int>(buffer.size()), 0,
+            SOCKET currentSocket;
+            {
+                std::lock_guard<std::mutex> lock(tunnel->socketMutex);
+                currentSocket = tunnel->clientSocket;
+            }
+
+            if (currentSocket == INVALID_SOCKET)
+            {
+                // Socket is being reset, wait a bit
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+
+            int received = recvfrom(currentSocket, buffer.data(), static_cast<int>(buffer.size()), 0,
                                     reinterpret_cast<sockaddr *>(&fromAddr), &fromLen);
 
             if (received == SOCKET_ERROR)
@@ -1144,6 +1171,11 @@ namespace
                 int err = WSAGetLastError();
                 if (err == WSAEINTR || err == WSAETIMEDOUT)
                 {
+                    continue;
+                }
+                if (err == WSAENOTSOCK)
+                {
+                    // Socket was closed for reconnection, continue to next iteration
                     continue;
                 }
                 if (tunnel->running.load(std::memory_order_acquire))
@@ -1165,10 +1197,14 @@ namespace
                 {
                     logMessage(LogLevel::Info, tunnel->tag, "Received UDP handshake from server, replying");
                     // Reply with our own handshake to complete the punch
-                    sendUdpHolePunchPacket(tunnel->clientSocket,
-                                           reinterpret_cast<sockaddr *>(&fromAddr),
-                                           fromLen,
-                                           UdpHolePunchPacketType::HANDSHAKE);
+                    std::lock_guard<std::mutex> lock(tunnel->socketMutex);
+                    if (tunnel->clientSocket != INVALID_SOCKET)
+                    {
+                        sendUdpHolePunchPacket(tunnel->clientSocket,
+                                               reinterpret_cast<sockaddr *>(&fromAddr),
+                                               fromLen,
+                                               UdpHolePunchPacketType::HANDSHAKE);
+                    }
                     continue;
                 }
                 // Handle ACK from server (connection established)
@@ -1179,8 +1215,11 @@ namespace
                                    std::to_string(tunnel->listenPort) + ")");
                     tunnel->connected.store(true, std::memory_order_release);
 
-                    // Start heartbeat thread
-                    tunnel->heartbeatThread = std::thread(udpHolePunchHeartbeat, tunnel);
+                    // Start heartbeat thread only if not already running
+                    if (!tunnel->heartbeatThread.joinable())
+                    {
+                        tunnel->heartbeatThread = std::thread(udpHolePunchHeartbeat, tunnel);
+                    }
                     continue;
                 }
                 else if (packet->type == UdpHolePunchPacketType::HEARTBEAT)
@@ -1232,6 +1271,149 @@ namespace
         {
             closesocket(tunnel->clientSocket);
         }
+    }
+
+    void resetUdpHolePunchTunnelForReconnect(std::shared_ptr<UdpHolePunchTunnel> tunnel)
+    {
+        if (!tunnel)
+        {
+            return;
+        }
+
+        logMessage(LogLevel::Info, tunnel->tag, "Resetting tunnel for reconnection");
+
+        // Disconnect state but keep running
+        tunnel->connected.store(false, std::memory_order_release);
+
+        // Stop and wait for heartbeat thread if it exists
+        if (tunnel->heartbeatThread.joinable())
+        {
+            tunnel->heartbeatThread.join();
+        }
+
+        // Close and recreate client socket with mutex protection
+        SOCKET newSocket = INVALID_SOCKET;
+        uint16_t newPort = 0;
+        
+        {
+            std::lock_guard<std::mutex> lock(tunnel->socketMutex);
+            
+            // Close old socket
+            if (tunnel->clientSocket != INVALID_SOCKET)
+            {
+                closesocket(tunnel->clientSocket);
+                tunnel->clientSocket = INVALID_SOCKET;
+            }
+        }
+        
+        // Create new socket outside the lock to avoid holding it too long
+        newSocket = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+        if (newSocket == INVALID_SOCKET)
+        {
+            logMessage(LogLevel::Error, tunnel->tag, "Failed to recreate client socket for reconnection");
+            return;
+        }
+
+        // Bind to random port
+        sockaddr_in6 clientAddr{};
+        clientAddr.sin6_family = AF_INET6;
+        clientAddr.sin6_addr = in6addr_any;
+        clientAddr.sin6_port = 0; // Let system choose port
+
+        if (bind(newSocket, reinterpret_cast<sockaddr *>(&clientAddr), sizeof(clientAddr)) == SOCKET_ERROR)
+        {
+            logMessage(LogLevel::Error, tunnel->tag, "Failed to bind client socket for reconnection");
+            closesocket(newSocket);
+            return;
+        }
+
+        // Get assigned port
+        int addrLen = sizeof(clientAddr);
+        if (getsockname(newSocket, reinterpret_cast<sockaddr *>(&clientAddr), &addrLen) == SOCKET_ERROR)
+        {
+            logMessage(LogLevel::Error, tunnel->tag, "Failed to get client socket port for reconnection");
+            closesocket(newSocket);
+            return;
+        }
+        newPort = ntohs(clientAddr.sin6_port);
+
+        // Set socket timeout
+        DWORD timeoutMs = 3000;
+        setSocketTimeout(newSocket, SO_RCVTIMEO, timeoutMs);
+
+        // Update tunnel with new socket under lock
+        {
+            std::lock_guard<std::mutex> lock(tunnel->socketMutex);
+            tunnel->clientSocket = newSocket;
+            tunnel->clientPort = newPort;
+        }
+
+        // Reset activity time
+        tunnel->lastActivity = Clock::now();
+
+        logMessage(LogLevel::Info, tunnel->tag, "Tunnel reset complete, new client_port=" + std::to_string(newPort));
+    }
+
+    void udpHolePunchConnectionManager(std::shared_ptr<UdpHolePunchTunnel> tunnel, const ServerEndpoint &serverEndpoint)
+    {
+        while (tunnel->running.load(std::memory_order_acquire))
+        {
+            // Attempt connection
+            logMessage(LogLevel::Info, tunnel->tag, "Attempting UDP hole punching connection");
+            
+            if (performUdpHolePunching(tunnel, serverEndpoint))
+            {
+                logMessage(LogLevel::Info, tunnel->tag, "UDP hole punching connection established");
+                
+                // Wait for connection to fail (connected will be set to false on timeout or error)
+                // Keep checking every second to allow quick response to shutdown
+                while (tunnel->running.load(std::memory_order_acquire) && tunnel->connected.load(std::memory_order_acquire))
+                {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+                
+                if (!tunnel->running.load(std::memory_order_acquire))
+                {
+                    // Shutdown requested, exit
+                    break;
+                }
+                
+                logMessage(LogLevel::Warn, tunnel->tag, "UDP hole punching connection lost, will retry");
+            }
+            else
+            {
+                logMessage(LogLevel::Error, tunnel->tag, "UDP hole punching connection failed, will retry");
+            }
+            
+            // Wait before reconnecting
+            logMessage(LogLevel::Info, tunnel->tag, "Waiting " + std::to_string(kReconnectDelay.count()) + " seconds before reconnection");
+            
+            auto waitStart = Clock::now();
+            while (tunnel->running.load(std::memory_order_acquire) && 
+                   (Clock::now() - waitStart) < kReconnectDelay)
+            {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            }
+            
+            if (!tunnel->running.load(std::memory_order_acquire))
+            {
+                // Shutdown requested during wait, exit
+                break;
+            }
+            
+            // Reset tunnel for reconnection
+            resetUdpHolePunchTunnelForReconnect(tunnel);
+            
+            if (tunnel->clientSocket == INVALID_SOCKET)
+            {
+                // Failed to reset, cannot retry
+                logMessage(LogLevel::Error, tunnel->tag, "Failed to reset tunnel for reconnection");
+                tunnel->running.store(false, std::memory_order_release);
+                break;
+            }
+        }
+        
+        logMessage(LogLevel::Info, tunnel->tag, "UDP hole punching connection manager exited");
     }
 
     void runUdpHolePunchingListener(const ConfigEntry &entry, const ServerEndpoint &serverEndpoint)
@@ -1319,15 +1501,8 @@ namespace
         // Start reader thread
         tunnel->readerThread = std::thread(udpHolePunchTunnelReader, tunnel);
 
-        // Perform hole punching immediately
-        std::thread holePunchThread([tunnel, serverEndpoint]()
-                                    {
-            if (!performUdpHolePunching(tunnel, serverEndpoint))
-            {
-                logMessage(LogLevel::Error, tunnel->tag, "UDP hole punching failed");
-                tunnel->running.store(false, std::memory_order_release);
-            } });
-        holePunchThread.detach();
+        // Start connection manager thread that handles connection and reconnection
+        std::thread connectionManagerThread(udpHolePunchConnectionManager, tunnel, serverEndpoint);
 
         logMessage(LogLevel::Info, tunnel->tag,
                    "UDP hole punch tunnel initiated -> server " + serverEndpoint.display +
@@ -1368,11 +1543,15 @@ namespace
             if (tunnel->connected.load(std::memory_order_acquire))
             {
                 tunnel->lastActivity = Clock::now();
-                int sent = sendto(tunnel->clientSocket, buffer.data(), received, 0,
-                                  reinterpret_cast<sockaddr *>(&tunnel->serverAddr), tunnel->serverAddrLen);
-                if (sent == SOCKET_ERROR)
+                std::lock_guard<std::mutex> lock(tunnel->socketMutex);
+                if (tunnel->clientSocket != INVALID_SOCKET)
                 {
-                    logMessage(LogLevel::Warn, tunnel->tag, "Failed to forward data to server");
+                    int sent = sendto(tunnel->clientSocket, buffer.data(), received, 0,
+                                      reinterpret_cast<sockaddr *>(&tunnel->serverAddr), tunnel->serverAddrLen);
+                    if (sent == SOCKET_ERROR)
+                    {
+                        logMessage(LogLevel::Warn, tunnel->tag, "Failed to forward data to server");
+                    }
                 }
             }
         }
@@ -1383,6 +1562,12 @@ namespace
         if (state.tunnel)
         {
             closeUdpHolePunchTunnel(state.tunnel, "Client shutting down");
+        }
+
+        // Wait for connection manager thread to complete
+        if (connectionManagerThread.joinable())
+        {
+            connectionManagerThread.join();
         }
 
         closesocket(udpSocket);
