@@ -1064,6 +1064,7 @@ namespace
                    ", server_port=" + std::to_string(tunnel->serverPort));
 
         // Start sending handshake packets
+        // The reader thread will receive handshake/ACK from server and set connected=true
         int retries = 0;
         while (tunnel->running.load(std::memory_order_acquire) && !tunnel->connected.load(std::memory_order_acquire) && retries < kMaxHandshakeRetries)
         {
@@ -1074,6 +1075,9 @@ namespace
             {
                 logMessage(LogLevel::Warn, tunnel->tag, "Failed to send handshake packet");
             }
+
+            // Update activity time to prevent idle timeout during handshake
+            tunnel->lastActivity = Clock::now();
 
             std::this_thread::sleep_for(kHandshakeInterval);
             retries++;
@@ -1151,7 +1155,19 @@ namespace
             {
                 UdpHolePunchPacket* packet = reinterpret_cast<UdpHolePunchPacket*>(buffer.data());
                 
-                if (packet->type == UdpHolePunchPacketType::ACK && !tunnel->connected.load(std::memory_order_acquire))
+                // Handle HANDSHAKE from server (mutual hole punching)
+                if (packet->type == UdpHolePunchPacketType::HANDSHAKE && !tunnel->connected.load(std::memory_order_acquire))
+                {
+                    logMessage(LogLevel::Info, tunnel->tag, "Received UDP handshake from server, replying");
+                    // Reply with our own handshake to complete the punch
+                    sendUdpHolePunchPacket(tunnel->clientSocket,
+                                          reinterpret_cast<sockaddr*>(&fromAddr),
+                                          fromLen,
+                                          UdpHolePunchPacketType::HANDSHAKE);
+                    continue;
+                }
+                // Handle ACK from server (connection established)
+                else if (packet->type == UdpHolePunchPacketType::ACK && !tunnel->connected.load(std::memory_order_acquire))
                 {
                     logMessage(LogLevel::Info, tunnel->tag, "UDP hole punching connected");
                     tunnel->connected.store(true, std::memory_order_release);
