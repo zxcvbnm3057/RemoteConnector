@@ -30,6 +30,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -43,6 +44,11 @@ namespace
 {
     constexpr size_t kMaxPayloadSize = 65535;
 
+    // UDP hole punching constants
+    constexpr std::chrono::seconds kHolePunchTimeout{30};
+    constexpr std::chrono::milliseconds kHandshakeInterval{500};
+    constexpr std::chrono::seconds kServerIdleTimeout{60};
+
     enum class LogLevel
     {
         Info,
@@ -54,7 +60,8 @@ namespace
     enum class ProxyProtocol : uint8_t
     {
         UDP = 0,
-        TCP = 1
+        TCP = 1,
+        UDP_HOLE_PUNCHING = 2
     };
 
     struct ConnectionContext
@@ -64,6 +71,20 @@ namespace
         uint16_t targetPort = 0;
         std::string remoteTag;
         std::atomic_bool running{true};
+    };
+
+    struct UdpHolePunchContext
+    {
+        SOCKET udpSocket = INVALID_SOCKET;
+        uint16_t serverPort = 0;
+        uint16_t clientPort = 0;
+        uint16_t targetPort = 0;
+        sockaddr_storage clientAddr{};
+        int clientAddrLen = 0;
+        std::atomic_bool running{true};
+        std::atomic_bool connected{false};
+        std::chrono::steady_clock::time_point lastActivity = std::chrono::steady_clock::now();
+        std::string remoteTag;
     };
 
     std::atomic_uint64_t g_connectionId{0};
@@ -344,6 +365,345 @@ namespace
         logMessage(LogLevel::Info, context.remoteTag, "UDP tunnel closed");
     }
 
+    // UDP Hole Punching functions
+    bool sendUdpHolePunchPacket(SOCKET socket, const sockaddr *addr, int addrLen, UdpHolePunchPacketType type, const char *data = nullptr, uint16_t dataLen = 0)
+    {
+        UdpHolePunchPacket packet;
+        packet.type = type;
+        packet.timestamp = htonl(static_cast<uint32_t>(std::time(nullptr)));
+        packet.data_len = htons(dataLen);
+
+        std::vector<char> buffer(sizeof(packet) + dataLen);
+        std::memcpy(buffer.data(), &packet, sizeof(packet));
+        if (data && dataLen > 0)
+        {
+            std::memcpy(buffer.data() + sizeof(packet), data, dataLen);
+        }
+
+        int sent = sendto(socket, buffer.data(), static_cast<int>(buffer.size()), 0, addr, addrLen);
+        return sent == static_cast<int>(buffer.size());
+    }
+
+    uint16_t getRandomPort()
+    {
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        static std::uniform_int_distribution<uint16_t> dis(49152, 65535); // Dynamic port range
+        return dis(gen);
+    }
+
+    void handleUdpHolePunching(SOCKET clientSocket, sockaddr_storage clientAddr, const ProxyHeader &header)
+    {
+        const uint64_t connId = ++g_connectionId;
+        std::string remoteTag = "[conn " + std::to_string(connId) + "][" + formatRemote(clientAddr) + "]";
+
+        uint16_t targetPort = ntohs(header.target_port);
+        uint16_t clientPort = ntohs(header.client_port);
+
+        logMessage(LogLevel::Info, remoteTag, "UDP hole punching handshake: target_port=" + std::to_string(targetPort) + ", client_port=" + std::to_string(clientPort));
+
+        UdpHolePunchContext context;
+        context.targetPort = targetPort;
+        context.clientPort = clientPort;
+        context.clientAddr = clientAddr;
+        context.clientAddrLen = sizeof(clientAddr);
+        context.remoteTag = remoteTag;
+
+        // Create UDP socket for hole punching
+        context.udpSocket = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+        if (context.udpSocket == INVALID_SOCKET)
+        {
+            logMessage(LogLevel::Error, remoteTag, "Failed to create UDP socket for hole punching");
+            ProxyHeader response{};
+            response.type = static_cast<uint8_t>(ProxyProtocol::UDP_HOLE_PUNCHING);
+            response.target_port = 0; // Signal error
+            sendAll(clientSocket, &response, sizeof(response));
+            return;
+        }
+
+        // Bind to random port
+        sockaddr_in6 serverAddr{};
+        serverAddr.sin6_family = AF_INET6;
+        serverAddr.sin6_addr = in6addr_any;
+        serverAddr.sin6_port = 0; // Let system choose
+
+        if (bind(context.udpSocket, reinterpret_cast<sockaddr *>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR)
+        {
+            logMessage(LogLevel::Error, remoteTag, "Failed to bind UDP socket");
+            closesocket(context.udpSocket);
+            ProxyHeader response{};
+            response.type = static_cast<uint8_t>(ProxyProtocol::UDP_HOLE_PUNCHING);
+            response.target_port = 0; // Signal error
+            sendAll(clientSocket, &response, sizeof(response));
+            return;
+        }
+
+        // Get assigned port
+        int addrLen = sizeof(serverAddr);
+        if (getsockname(context.udpSocket, reinterpret_cast<sockaddr *>(&serverAddr), &addrLen) == SOCKET_ERROR)
+        {
+            logMessage(LogLevel::Error, remoteTag, "Failed to get server socket port");
+            closesocket(context.udpSocket);
+            ProxyHeader response{};
+            response.type = static_cast<uint8_t>(ProxyProtocol::UDP_HOLE_PUNCHING);
+            response.target_port = 0; // Signal error
+            sendAll(clientSocket, &response, sizeof(response));
+            return;
+        }
+
+        context.serverPort = ntohs(serverAddr.sin6_port);
+
+        // Set client address port for hole punching
+        if (clientAddr.ss_family == AF_INET6)
+        {
+            reinterpret_cast<sockaddr_in6 *>(&context.clientAddr)->sin6_port = htons(clientPort);
+        }
+        else
+        {
+            reinterpret_cast<sockaddr_in *>(&context.clientAddr)->sin_port = htons(clientPort);
+        }
+
+        // Send response with server port
+        ProxyHeader response{};
+        response.type = static_cast<uint8_t>(ProxyProtocol::UDP_HOLE_PUNCHING);
+        response.target_port = htons(context.serverPort);
+        response.datalen = 0;
+        response.client_port = 0;
+
+        if (!sendAll(clientSocket, &response, sizeof(response)))
+        {
+            logMessage(LogLevel::Error, remoteTag, "Failed to send handshake response");
+            closesocket(context.udpSocket);
+            return;
+        }
+
+        // Close TCP connection after handshake
+        closesocket(clientSocket);
+
+        logMessage(LogLevel::Info, remoteTag, "Starting UDP hole punching on port " + std::to_string(context.serverPort));
+
+        // Set socket timeout for receiving
+        DWORD timeoutMs = 3000;
+        setSocketTimeout(context.udpSocket, SO_RCVTIMEO, timeoutMs);
+
+        // Start sending handshake packets to client in a separate thread
+        // This allows simultaneous sending and receiving for proper hole punching
+        std::thread handshakeSender([&context, remoteTag]()
+                                    {
+            auto handshakeStart = std::chrono::steady_clock::now();
+            while (context.running.load(std::memory_order_acquire) && !context.connected.load(std::memory_order_acquire))
+            {
+                if ((std::chrono::steady_clock::now() - handshakeStart) > kHolePunchTimeout)
+                {
+                    logMessage(LogLevel::Warn, remoteTag, "UDP hole punching timeout");
+                    context.running.store(false, std::memory_order_release);
+                    break;
+                }
+
+                sendUdpHolePunchPacket(context.udpSocket,
+                                      reinterpret_cast<sockaddr*>(&context.clientAddr),
+                                      context.clientAddrLen,
+                                      UdpHolePunchPacketType::HANDSHAKE);
+
+                std::this_thread::sleep_for(kHandshakeInterval);
+            } });
+
+        // Receive loop for handshake - runs simultaneously with sender
+        std::vector<char> buffer(kMaxPayloadSize);
+        while (context.running.load(std::memory_order_acquire) && !context.connected.load(std::memory_order_acquire))
+        {
+            sockaddr_storage fromAddr{};
+            int fromLen = sizeof(fromAddr);
+
+            int received = recvfrom(context.udpSocket, buffer.data(), static_cast<int>(buffer.size()), 0,
+                                    reinterpret_cast<sockaddr *>(&fromAddr), &fromLen);
+
+            if (received == SOCKET_ERROR)
+            {
+                int err = WSAGetLastError();
+                if (err == WSAETIMEDOUT)
+                {
+                    continue; // Keep waiting for handshake
+                }
+                if (context.running.load(std::memory_order_acquire))
+                {
+                    logMessage(LogLevel::Warn, remoteTag, "UDP recv failed during handshake, WSA error=" + std::to_string(err));
+                }
+                break;
+            }
+
+            context.lastActivity = std::chrono::steady_clock::now();
+
+            // Check if this is a handshake packet from client
+            if (received >= static_cast<int>(sizeof(UdpHolePunchPacket)))
+            {
+                UdpHolePunchPacket *packet = reinterpret_cast<UdpHolePunchPacket *>(buffer.data());
+                if (packet->type == UdpHolePunchPacketType::HANDSHAKE)
+                {
+                    logMessage(LogLevel::Info, remoteTag,
+                               "UDP hole punching connected (targetPort port " +
+                                   std::to_string(context.targetPort) + ")");
+                    context.connected.store(true, std::memory_order_release);
+
+                    // Send ACK
+                    sendUdpHolePunchPacket(context.udpSocket,
+                                           reinterpret_cast<sockaddr *>(&fromAddr),
+                                           fromLen,
+                                           UdpHolePunchPacketType::ACK);
+                    break; // Exit handshake receive loop
+                }
+            }
+        }
+
+        // Wait for sender thread to complete
+        // if (handshakeSender.joinable())
+        // {
+        //     handshakeSender.join();
+        // }
+
+        if (!context.connected.load(std::memory_order_acquire))
+        {
+            logMessage(LogLevel::Error, remoteTag, "UDP hole punching failed - no connection established");
+            closesocket(context.udpSocket);
+            return;
+        }
+
+        // Create target socket for forwarding
+        SOCKET targetSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (targetSocket == INVALID_SOCKET)
+        {
+            logMessage(LogLevel::Error, remoteTag, "Failed to create target socket");
+            closesocket(context.udpSocket);
+            return;
+        }
+
+        sockaddr_in targetAddr{};
+        targetAddr.sin_family = AF_INET;
+        targetAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        targetAddr.sin_port = htons(targetPort);
+
+        if (connect(targetSocket, reinterpret_cast<sockaddr *>(&targetAddr), sizeof(targetAddr)) == SOCKET_ERROR)
+        {
+            logMessage(LogLevel::Error, remoteTag, "Failed to connect to target");
+            closesocket(targetSocket);
+            closesocket(context.udpSocket);
+            return;
+        }
+
+        logMessage(LogLevel::Info, remoteTag, "UDP hole punch tunnel established to target 127.0.0.1:" + std::to_string(targetPort));
+
+        // Socket timeout already set during handshake
+        setSocketTimeout(targetSocket, SO_RCVTIMEO, 3000);
+
+        // Start forwarding thread for target -> client
+        std::thread targetToClient([&context, targetSocket]()
+                                   {
+            std::vector<char> buffer(kMaxPayloadSize);
+            while (context.running.load(std::memory_order_acquire))
+            {
+                int received = recv(targetSocket, buffer.data(), static_cast<int>(buffer.size()), 0);
+                if (received == SOCKET_ERROR)
+                {
+                    int err = WSAGetLastError();
+                    if (err == WSAETIMEDOUT)
+                    {
+                        continue;
+                    }
+                    if (context.running.load(std::memory_order_acquire))
+                    {
+                        logMessage(LogLevel::Warn, context.remoteTag, "Target recv failed, WSA error=" + std::to_string(err));
+                    }
+                    break;
+                }
+                if (received == 0)
+                {
+                    logMessage(LogLevel::Info, context.remoteTag, "Target closed connection");
+                    break;
+                }
+
+                context.lastActivity = std::chrono::steady_clock::now();
+
+                // Forward to client
+                int sent = sendto(context.udpSocket, buffer.data(), received, 0,
+                                reinterpret_cast<sockaddr*>(&context.clientAddr), context.clientAddrLen);
+                if (sent == SOCKET_ERROR)
+                {
+                    logMessage(LogLevel::Warn, context.remoteTag, "Failed to forward data to client");
+                    break;
+                }
+            }
+            context.running.store(false, std::memory_order_release); });
+
+        // Main loop: client -> target
+        buffer.clear();
+        buffer.resize(kMaxPayloadSize);
+        while (context.running.load(std::memory_order_acquire))
+        {
+            sockaddr_storage fromAddr{};
+            int fromLen = sizeof(fromAddr);
+
+            int received = recvfrom(context.udpSocket, buffer.data(), static_cast<int>(buffer.size()), 0,
+                                    reinterpret_cast<sockaddr *>(&fromAddr), &fromLen);
+
+            if (received == SOCKET_ERROR)
+            {
+                int err = WSAGetLastError();
+                if (err == WSAETIMEDOUT)
+                {
+                    // Check for idle timeout
+                    auto now = std::chrono::steady_clock::now();
+                    if ((now - context.lastActivity) > kServerIdleTimeout)
+                    {
+                        logMessage(LogLevel::Info, remoteTag, "UDP hole punch tunnel idle timeout");
+                        break;
+                    }
+                    continue;
+                }
+                if (context.running.load(std::memory_order_acquire))
+                {
+                    logMessage(LogLevel::Warn, remoteTag, "UDP recv failed, WSA error=" + std::to_string(err));
+                }
+                break;
+            }
+
+            context.lastActivity = std::chrono::steady_clock::now();
+
+            // Check for heartbeat
+            if (received >= static_cast<int>(sizeof(UdpHolePunchPacket)))
+            {
+                UdpHolePunchPacket *packet = reinterpret_cast<UdpHolePunchPacket *>(buffer.data());
+                if (packet->type == UdpHolePunchPacketType::HEARTBEAT)
+                {
+                    // Reply to heartbeat
+                    sendUdpHolePunchPacket(context.udpSocket,
+                                           reinterpret_cast<sockaddr *>(&fromAddr),
+                                           fromLen,
+                                           UdpHolePunchPacketType::HEARTBEAT);
+                    continue;
+                }
+            }
+
+            // Forward data to target
+            int sent = send(targetSocket, buffer.data(), received, 0);
+            if (sent == SOCKET_ERROR)
+            {
+                logMessage(LogLevel::Warn, remoteTag, "Failed to forward data to target");
+                break;
+            }
+        }
+
+        context.running.store(false, std::memory_order_release);
+
+        if (targetToClient.joinable())
+        {
+            targetToClient.join();
+        }
+
+        closesocket(targetSocket);
+        closesocket(context.udpSocket);
+        logMessage(LogLevel::Info, remoteTag, "UDP hole punch tunnel closed");
+    }
+
     void tcpTargetToClientPump(ConnectionContext &context, SOCKET targetSocket, std::atomic_bool &running)
     {
         std::vector<char> buffer(kMaxPayloadSize);
@@ -490,7 +850,8 @@ namespace
         setSocketTimeout(clientSocket, SO_RCVTIMEO, blockingTimeout);
 
         if (header.type != static_cast<uint8_t>(ProxyProtocol::UDP) &&
-            header.type != static_cast<uint8_t>(ProxyProtocol::TCP))
+            header.type != static_cast<uint8_t>(ProxyProtocol::TCP) &&
+            header.type != static_cast<uint8_t>(ProxyProtocol::UDP_HOLE_PUNCHING))
         {
             logMessage(LogLevel::Warn, context.remoteTag, "Unsupported protocol type in handshake");
             closesocket(clientSocket);
@@ -517,6 +878,13 @@ namespace
             logMessage(LogLevel::Warn, context.remoteTag, "Handshake target port is zero, closing");
             closesocket(clientSocket);
             return;
+        }
+
+        // Handle UDP hole punching separately (it doesn't follow the same pattern)
+        if (context.protocol == ProxyProtocol::UDP_HOLE_PUNCHING)
+        {
+            handleUdpHolePunching(clientSocket, clientAddr, header);
+            return; // Don't close socket here, it's handled in handleUdpHolePunching
         }
 
         std::string protoStr = context.protocol == ProxyProtocol::UDP ? "UDP" : "TCP";

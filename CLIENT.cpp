@@ -33,6 +33,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -52,6 +53,12 @@ namespace
     constexpr std::chrono::seconds kUdpIdleTimeout{60};
     constexpr std::chrono::seconds kUdpSweepInterval{5};
 
+    // UDP hole punching constants
+    constexpr std::chrono::seconds kHeartbeatInterval{20};
+    constexpr std::chrono::seconds kMaxIdleTime{40}; // 2 * heartbeat interval
+    constexpr std::chrono::milliseconds kHandshakeInterval{1000};
+    constexpr int kMaxHandshakeRetries = 30;
+
     enum class LogLevel
     {
         Info,
@@ -63,13 +70,20 @@ namespace
     enum class ProxyProtocol : uint8_t
     {
         UDP = 0,
-        TCP = 1
+        TCP = 1,
+        UDP_HOLE_PUNCHING = 2
     };
 
     struct ConfigEntry
     {
         ProxyProtocol protocol = ProxyProtocol::UDP;
         uint16_t listenPort = 0;
+    };
+
+    struct Config
+    {
+        bool udpOverTcp = true; // default to existing behavior
+        std::vector<ConfigEntry> entries;
     };
 
     struct ServerEndpoint
@@ -99,6 +113,38 @@ namespace
         std::mutex mutex;
         std::atomic_bool running{true};
         std::thread sweepThread;
+        std::string logTag;
+    };
+
+    struct UdpHolePunchTunnel
+    {
+        SOCKET clientSocket = INVALID_SOCKET; // 客户端随机端口socket
+        SOCKET listenSocket = INVALID_SOCKET; // 监听端口socket
+        uint16_t listenPort = 0;              // 本地监听端口
+        uint16_t clientPort = 0;              // 客户端随机端口
+        uint16_t serverPort = 0;              // 服务端端口
+        sockaddr_storage serverAddr{};        // 服务端地址
+        int serverAddrLen = 0;
+        std::atomic_bool running{true};
+        std::atomic_bool connected{false};
+        Clock::time_point lastActivity = Clock::now();
+        std::thread readerThread;
+        std::thread heartbeatThread;
+        std::string tag;
+
+        // Track the most recent local client for response routing
+        sockaddr_storage lastLocalClient{};
+        int lastLocalClientLen = 0;
+        std::mutex clientMutex;
+    };
+
+    struct UdpHolePunchListenerState
+    {
+        SOCKET udpSocket = INVALID_SOCKET;
+        uint16_t listenPort = 0;
+        std::shared_ptr<UdpHolePunchTunnel> tunnel; // Single tunnel per port
+        std::mutex mutex;
+        std::atomic_bool running{true};
         std::string logTag;
     };
 
@@ -266,7 +312,24 @@ namespace
         return true;
     }
 
-    std::vector<ConfigEntry> loadConfig(const std::string &path)
+    std::string trimLine(const std::string &line)
+    {
+        std::string result = line;
+        auto commentPos = result.find('#');
+        if (commentPos != std::string::npos)
+        {
+            result = result.substr(0, commentPos);
+        }
+        result.erase(result.begin(), std::find_if(result.begin(), result.end(), [](unsigned char ch)
+                                                  { return !std::isspace(ch); }));
+        result.erase(std::find_if(result.rbegin(), result.rend(), [](unsigned char ch)
+                                  { return !std::isspace(ch); })
+                         .base(),
+                     result.end());
+        return result;
+    }
+
+    Config loadConfig(const std::string &path)
     {
         std::ifstream file(path);
         if (!file.is_open())
@@ -274,72 +337,163 @@ namespace
             throw std::runtime_error("Unable to open config file: " + path);
         }
 
-        std::vector<ConfigEntry> entries;
+        Config config;
         std::string line;
         int lineNumber = 0;
+        enum class Section
+        {
+            None,
+            Generic,
+            Proxies
+        } currentSection = Section::None;
+
         while (std::getline(file, line))
         {
             ++lineNumber;
-            auto commentPos = line.find('#');
-            if (commentPos != std::string::npos)
-            {
-                line = line.substr(0, commentPos);
-            }
-            line.erase(line.begin(), std::find_if(line.begin(), line.end(), [](unsigned char ch)
-                                                  { return !std::isspace(ch); }));
-            line.erase(std::find_if(line.rbegin(), line.rend(), [](unsigned char ch)
-                                    { return !std::isspace(ch); })
-                           .base(),
-                       line.end());
+            std::string trimmed = trimLine(line);
 
-            if (line.empty())
+            if (trimmed.empty())
             {
                 continue;
             }
 
-            const auto commaPos = line.find(',');
-            if (commaPos == std::string::npos)
+            // Check for section headers
+            if (trimmed.front() == '[' && trimmed.back() == ']')
             {
-                throw std::runtime_error("Invalid config line " + std::to_string(lineNumber) + ": " + line);
+                std::string sectionName = trimmed.substr(1, trimmed.length() - 2);
+                std::transform(sectionName.begin(), sectionName.end(), sectionName.begin(), [](unsigned char ch)
+                               { return static_cast<char>(std::tolower(ch)); });
+
+                if (sectionName == "generic")
+                {
+                    currentSection = Section::Generic;
+                }
+                else if (sectionName == "proxies")
+                {
+                    currentSection = Section::Proxies;
+                }
+                else
+                {
+                    throw std::runtime_error("Unknown section on line " + std::to_string(lineNumber) + ": " + sectionName);
+                }
+                continue;
             }
 
-            std::string protocolStr = line.substr(0, commaPos);
-            std::string portStr = line.substr(commaPos + 1);
-
-            std::transform(protocolStr.begin(), protocolStr.end(), protocolStr.begin(), [](unsigned char ch)
-                           { return static_cast<char>(std::tolower(ch)); });
-
-            ConfigEntry entry;
-            if (protocolStr == "udp")
+            // Parse content based on current section
+            if (currentSection == Section::Generic)
             {
-                entry.protocol = ProxyProtocol::UDP;
+                const auto equalPos = trimmed.find('=');
+                if (equalPos == std::string::npos)
+                {
+                    throw std::runtime_error("Invalid config line " + std::to_string(lineNumber) + ": " + trimmed);
+                }
+
+                std::string key = trimmed.substr(0, equalPos);
+                std::string value = trimmed.substr(equalPos + 1);
+
+                // Trim key and value
+                key = trimLine(key);
+                value = trimLine(value);
+
+                std::transform(key.begin(), key.end(), key.begin(), [](unsigned char ch)
+                               { return static_cast<char>(std::tolower(ch)); });
+                std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch)
+                               { return static_cast<char>(std::tolower(ch)); });
+
+                if (key == "udp_over_tcp")
+                {
+                    config.udpOverTcp = (value == "true");
+                }
+                else
+                {
+                    throw std::runtime_error("Unknown config key on line " + std::to_string(lineNumber) + ": " + key);
+                }
             }
-            else if (protocolStr == "tcp")
+            else if (currentSection == Section::Proxies)
             {
-                entry.protocol = ProxyProtocol::TCP;
+                const auto commaPos = trimmed.find(',');
+                if (commaPos == std::string::npos)
+                {
+                    throw std::runtime_error("Invalid proxy config line " + std::to_string(lineNumber) + ": " + trimmed);
+                }
+
+                std::string protocolStr = trimmed.substr(0, commaPos);
+                std::string portStr = trimmed.substr(commaPos + 1);
+
+                std::transform(protocolStr.begin(), protocolStr.end(), protocolStr.begin(), [](unsigned char ch)
+                               { return static_cast<char>(std::tolower(ch)); });
+
+                ConfigEntry entry;
+                if (protocolStr == "udp")
+                {
+                    entry.protocol = ProxyProtocol::UDP;
+                }
+                else if (protocolStr == "tcp")
+                {
+                    entry.protocol = ProxyProtocol::TCP;
+                }
+                else
+                {
+                    throw std::runtime_error("Unknown protocol on line " + std::to_string(lineNumber) + ": " +
+                                             protocolStr);
+                }
+
+                unsigned long portValue = std::stoul(portStr);
+                if (portValue == 0 || portValue > 65535)
+                {
+                    throw std::runtime_error("Invalid port on line " + std::to_string(lineNumber) + ": " + portStr);
+                }
+
+                entry.listenPort = static_cast<uint16_t>(portValue);
+                config.entries.push_back(entry);
             }
             else
             {
-                throw std::runtime_error("Unknown protocol on line " + std::to_string(lineNumber) + ": " +
-                                         protocolStr);
-            }
+                // Legacy format support - treat as proxy entries
+                const auto commaPos = trimmed.find(',');
+                if (commaPos == std::string::npos)
+                {
+                    throw std::runtime_error("Invalid config line " + std::to_string(lineNumber) + ": " + trimmed);
+                }
 
-            unsigned long portValue = std::stoul(portStr);
-            if (portValue == 0 || portValue > 65535)
-            {
-                throw std::runtime_error("Invalid port on line " + std::to_string(lineNumber) + ": " + portStr);
-            }
+                std::string protocolStr = trimmed.substr(0, commaPos);
+                std::string portStr = trimmed.substr(commaPos + 1);
 
-            entry.listenPort = static_cast<uint16_t>(portValue);
-            entries.push_back(entry);
+                std::transform(protocolStr.begin(), protocolStr.end(), protocolStr.begin(), [](unsigned char ch)
+                               { return static_cast<char>(std::tolower(ch)); });
+
+                ConfigEntry entry;
+                if (protocolStr == "udp")
+                {
+                    entry.protocol = ProxyProtocol::UDP;
+                }
+                else if (protocolStr == "tcp")
+                {
+                    entry.protocol = ProxyProtocol::TCP;
+                }
+                else
+                {
+                    throw std::runtime_error("Unknown protocol on line " + std::to_string(lineNumber) + ": " +
+                                             protocolStr);
+                }
+
+                unsigned long portValue = std::stoul(portStr);
+                if (portValue == 0 || portValue > 65535)
+                {
+                    throw std::runtime_error("Invalid port on line " + std::to_string(lineNumber) + ": " + portStr);
+                }
+
+                entry.listenPort = static_cast<uint16_t>(portValue);
+                config.entries.push_back(entry);
+            }
         }
 
-        if (entries.empty())
+        if (config.entries.empty())
         {
-            throw std::runtime_error("No valid entries in config file");
+            throw std::runtime_error("No valid proxy entries in config file");
         }
 
-        return entries;
+        return config;
     }
 
     SOCKET connectToServer(const ServerEndpoint &endpoint, const std::string &tag)
@@ -831,6 +985,410 @@ namespace
         logMessage(LogLevel::Info, logTag, "TCP listener stopped");
     }
 
+    // UDP Hole Punching functions
+    uint16_t getRandomPort()
+    {
+        static std::random_device rd;
+        static std::mt19937 gen(rd());
+        static std::uniform_int_distribution<uint16_t> dis(49152, 65535); // Dynamic port range
+        return dis(gen);
+    }
+
+    bool sendUdpHolePunchPacket(SOCKET socket, const sockaddr *addr, int addrLen, UdpHolePunchPacketType type, const char *data = nullptr, uint16_t dataLen = 0)
+    {
+        UdpHolePunchPacket packet;
+        packet.type = type;
+        packet.timestamp = htonl(static_cast<uint32_t>(std::time(nullptr)));
+        packet.data_len = htons(dataLen);
+
+        std::vector<char> buffer(sizeof(packet) + dataLen);
+        std::memcpy(buffer.data(), &packet, sizeof(packet));
+        if (data && dataLen > 0)
+        {
+            std::memcpy(buffer.data() + sizeof(packet), data, dataLen);
+        }
+
+        int sent = sendto(socket, buffer.data(), static_cast<int>(buffer.size()), 0, addr, addrLen);
+        return sent == static_cast<int>(buffer.size());
+    }
+
+    bool sendTcpHandshakeWithPort(SOCKET socket, ProxyProtocol protocol, uint16_t targetPort, uint16_t clientPort, const std::string &tag)
+    {
+        ProxyHeader header{};
+        header.type = static_cast<uint8_t>(protocol);
+        header.target_port = htons(targetPort);
+        header.datalen = htons(0);
+        header.client_port = htons(clientPort);
+
+        if (!sendAll(socket, &header, sizeof(header)))
+        {
+            logMessage(LogLevel::Warn, tag, "Failed to send handshake header");
+            return false;
+        }
+        flushTcp(socket);
+        return true;
+    }
+
+    bool performUdpHolePunching(std::shared_ptr<UdpHolePunchTunnel> tunnel, const ServerEndpoint &serverEndpoint)
+    {
+        // Create TCP connection for handshake
+        SOCKET tcpSocket = connectToServer(serverEndpoint, tunnel->tag);
+        if (tcpSocket == INVALID_SOCKET)
+        {
+            logMessage(LogLevel::Error, tunnel->tag, "Failed to connect to server for handshake");
+            return false;
+        }
+
+        // Send TCP handshake with client port
+        if (!sendTcpHandshakeWithPort(tcpSocket, ProxyProtocol::UDP_HOLE_PUNCHING, tunnel->listenPort, tunnel->clientPort, tunnel->tag))
+        {
+            logMessage(LogLevel::Error, tunnel->tag, "Failed to send handshake");
+            closesocket(tcpSocket);
+            return false;
+        }
+
+        // Receive server response with server port
+        ProxyHeader response{};
+        if (!recvExact(tcpSocket, &response, sizeof(response)))
+        {
+            logMessage(LogLevel::Error, tunnel->tag, "Failed to receive handshake response");
+            closesocket(tcpSocket);
+            return false;
+        }
+
+        tunnel->serverPort = ntohs(response.target_port);
+        closesocket(tcpSocket);
+
+        // Setup server address with received port
+        std::memcpy(&tunnel->serverAddr, &serverEndpoint.addr, sizeof(serverEndpoint.addr));
+        reinterpret_cast<sockaddr_in6 *>(&tunnel->serverAddr)->sin6_port = htons(tunnel->serverPort);
+        tunnel->serverAddrLen = sizeof(sockaddr_in6);
+
+        logMessage(LogLevel::Info, tunnel->tag,
+                   "Starting UDP hole punching: client_port=" + std::to_string(tunnel->clientPort) +
+                       ", server_port=" + std::to_string(tunnel->serverPort));
+
+        // Start sending handshake packets
+        // The reader thread will receive handshake/ACK from server and set connected=true
+        int retries = 0;
+        while (tunnel->running.load(std::memory_order_acquire) && !tunnel->connected.load(std::memory_order_acquire) && retries < kMaxHandshakeRetries)
+        {
+            if (!sendUdpHolePunchPacket(tunnel->clientSocket,
+                                        reinterpret_cast<sockaddr *>(&tunnel->serverAddr),
+                                        tunnel->serverAddrLen,
+                                        UdpHolePunchPacketType::HANDSHAKE))
+            {
+                logMessage(LogLevel::Warn, tunnel->tag, "Failed to send handshake packet");
+            }
+
+            // Update activity time to prevent idle timeout during handshake
+            tunnel->lastActivity = Clock::now();
+
+            std::this_thread::sleep_for(kHandshakeInterval);
+            retries++;
+        }
+
+        if (!tunnel->connected.load(std::memory_order_acquire))
+        {
+            logMessage(LogLevel::Error, tunnel->tag, "UDP hole punching handshake timeout");
+            return false;
+        }
+
+        return true;
+    }
+
+    void udpHolePunchHeartbeat(std::shared_ptr<UdpHolePunchTunnel> tunnel)
+    {
+        while (tunnel->running.load(std::memory_order_acquire) && tunnel->connected.load(std::memory_order_acquire))
+        {
+            std::this_thread::sleep_for(kHeartbeatInterval);
+
+            if (!tunnel->running.load(std::memory_order_acquire) || !tunnel->connected.load(std::memory_order_acquire))
+            {
+                break;
+            }
+
+            // Check if we've been idle too long
+            auto now = Clock::now();
+            if ((now - tunnel->lastActivity) > kMaxIdleTime)
+            {
+                logMessage(LogLevel::Warn, tunnel->tag, "UDP hole punch tunnel idle timeout");
+                tunnel->running.store(false, std::memory_order_release);
+                break;
+            }
+
+            // Send heartbeat
+            if (!sendUdpHolePunchPacket(tunnel->clientSocket,
+                                        reinterpret_cast<sockaddr *>(&tunnel->serverAddr),
+                                        tunnel->serverAddrLen,
+                                        UdpHolePunchPacketType::HEARTBEAT))
+            {
+                logMessage(LogLevel::Warn, tunnel->tag, "Failed to send heartbeat");
+            }
+        }
+    }
+
+    void udpHolePunchTunnelReader(std::shared_ptr<UdpHolePunchTunnel> tunnel)
+    {
+        std::vector<char> buffer(kMaxPayloadSize);
+        while (tunnel->running.load(std::memory_order_acquire))
+        {
+            sockaddr_storage fromAddr{};
+            int fromLen = sizeof(fromAddr);
+
+            int received = recvfrom(tunnel->clientSocket, buffer.data(), static_cast<int>(buffer.size()), 0,
+                                    reinterpret_cast<sockaddr *>(&fromAddr), &fromLen);
+
+            if (received == SOCKET_ERROR)
+            {
+                int err = WSAGetLastError();
+                if (err == WSAEINTR || err == WSAETIMEDOUT)
+                {
+                    continue;
+                }
+                if (tunnel->running.load(std::memory_order_acquire))
+                {
+                    logMessage(LogLevel::Warn, tunnel->tag, "UDP receive failed, WSA error=" + std::to_string(err));
+                }
+                break;
+            }
+
+            tunnel->lastActivity = Clock::now();
+
+            // Check if this is a control packet
+            if (received >= static_cast<int>(sizeof(UdpHolePunchPacket)))
+            {
+                UdpHolePunchPacket *packet = reinterpret_cast<UdpHolePunchPacket *>(buffer.data());
+
+                // Handle HANDSHAKE from server (mutual hole punching)
+                if (packet->type == UdpHolePunchPacketType::HANDSHAKE && !tunnel->connected.load(std::memory_order_acquire))
+                {
+                    logMessage(LogLevel::Info, tunnel->tag, "Received UDP handshake from server, replying");
+                    // Reply with our own handshake to complete the punch
+                    sendUdpHolePunchPacket(tunnel->clientSocket,
+                                           reinterpret_cast<sockaddr *>(&fromAddr),
+                                           fromLen,
+                                           UdpHolePunchPacketType::HANDSHAKE);
+                    continue;
+                }
+                // Handle ACK from server (connection established)
+                else if (packet->type == UdpHolePunchPacketType::ACK && !tunnel->connected.load(std::memory_order_acquire))
+                {
+                    logMessage(LogLevel::Info, tunnel->tag,
+                               "UDP hole punching connected (proxy port " +
+                                   std::to_string(tunnel->listenPort) + ")");
+                    tunnel->connected.store(true, std::memory_order_release);
+
+                    // Start heartbeat thread
+                    tunnel->heartbeatThread = std::thread(udpHolePunchHeartbeat, tunnel);
+                    continue;
+                }
+                else if (packet->type == UdpHolePunchPacketType::HEARTBEAT)
+                {
+                    // Server heartbeat response, just update activity time
+                    continue;
+                }
+            }
+
+            // Forward data to the most recent local client
+            if (tunnel->connected.load(std::memory_order_acquire))
+            {
+                std::lock_guard<std::mutex> lock(tunnel->clientMutex);
+                if (tunnel->lastLocalClientLen > 0)
+                {
+                    int sent = sendto(tunnel->listenSocket, buffer.data(), received, 0,
+                                      reinterpret_cast<sockaddr *>(&tunnel->lastLocalClient), tunnel->lastLocalClientLen);
+                    if (sent == SOCKET_ERROR)
+                    {
+                        logMessage(LogLevel::Warn, tunnel->tag, "Failed to forward data to local client");
+                    }
+                }
+            }
+        }
+    }
+
+    void closeUdpHolePunchTunnel(std::shared_ptr<UdpHolePunchTunnel> tunnel, const std::string &reason)
+    {
+        if (!tunnel)
+        {
+            return;
+        }
+
+        logMessage(LogLevel::Info, tunnel->tag, "Closing UDP hole punch tunnel: " + reason);
+
+        tunnel->running.store(false, std::memory_order_release);
+
+        if (tunnel->readerThread.joinable())
+        {
+            tunnel->readerThread.join();
+        }
+
+        if (tunnel->heartbeatThread.joinable())
+        {
+            tunnel->heartbeatThread.join();
+        }
+
+        if (tunnel->clientSocket != INVALID_SOCKET)
+        {
+            closesocket(tunnel->clientSocket);
+        }
+    }
+
+    void runUdpHolePunchingListener(const ConfigEntry &entry, const ServerEndpoint &serverEndpoint)
+    {
+        SOCKET udpSocket = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+        if (udpSocket == INVALID_SOCKET)
+        {
+            logMessage(LogLevel::Error, "[udp-hp]",
+                       "Failed to create UDP socket for port " + std::to_string(entry.listenPort) +
+                           ", WSA error=" + std::to_string(WSAGetLastError()));
+            return;
+        }
+
+        const int dualStack = 0;
+        setsockopt(udpSocket, IPPROTO_IPV6, IPV6_V6ONLY, reinterpret_cast<const char *>(&dualStack), sizeof(dualStack));
+
+        sockaddr_in6 addr{};
+        addr.sin6_family = AF_INET6;
+        addr.sin6_addr = in6addr_any;
+        addr.sin6_port = htons(entry.listenPort);
+
+        if (bind(udpSocket, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) == SOCKET_ERROR)
+        {
+            logMessage(LogLevel::Error, "[udp-hp]",
+                       "Failed to bind UDP port " + std::to_string(entry.listenPort) + ", WSA error=" +
+                           std::to_string(WSAGetLastError()));
+            closesocket(udpSocket);
+            return;
+        }
+
+        UdpHolePunchListenerState state;
+        state.udpSocket = udpSocket;
+        state.listenPort = entry.listenPort;
+        state.logTag = "[udp-hp:" + std::to_string(entry.listenPort) + ']';
+
+        logMessage(LogLevel::Info, state.logTag, "Listening for UDP clients (hole punching mode)");
+
+        // Create tunnel immediately on startup
+        auto tunnel = std::make_shared<UdpHolePunchTunnel>();
+        tunnel->listenPort = entry.listenPort;
+        tunnel->listenSocket = udpSocket;
+        tunnel->tag = state.logTag;
+        tunnel->lastActivity = Clock::now();
+
+        // Create client socket with random port
+        tunnel->clientSocket = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
+        if (tunnel->clientSocket == INVALID_SOCKET)
+        {
+            logMessage(LogLevel::Error, state.logTag, "Failed to create client socket");
+            closesocket(udpSocket);
+            return;
+        }
+
+        // Bind to random port
+        sockaddr_in6 clientAddr{};
+        clientAddr.sin6_family = AF_INET6;
+        clientAddr.sin6_addr = in6addr_any;
+        clientAddr.sin6_port = 0; // Let system choose port
+
+        if (bind(tunnel->clientSocket, reinterpret_cast<sockaddr *>(&clientAddr), sizeof(clientAddr)) == SOCKET_ERROR)
+        {
+            logMessage(LogLevel::Error, state.logTag, "Failed to bind client socket");
+            closesocket(tunnel->clientSocket);
+            closesocket(udpSocket);
+            return;
+        }
+
+        // Get assigned port
+        int addrLen = sizeof(clientAddr);
+        if (getsockname(tunnel->clientSocket, reinterpret_cast<sockaddr *>(&clientAddr), &addrLen) == SOCKET_ERROR)
+        {
+            logMessage(LogLevel::Error, state.logTag, "Failed to get client socket port");
+            closesocket(tunnel->clientSocket);
+            closesocket(udpSocket);
+            return;
+        }
+        tunnel->clientPort = ntohs(clientAddr.sin6_port);
+
+        // Set socket timeout
+        DWORD timeoutMs = 3000;
+        setSocketTimeout(tunnel->clientSocket, SO_RCVTIMEO, timeoutMs);
+
+        state.tunnel = tunnel;
+
+        // Start reader thread
+        tunnel->readerThread = std::thread(udpHolePunchTunnelReader, tunnel);
+
+        // Perform hole punching immediately
+        std::thread holePunchThread([tunnel, serverEndpoint]()
+                                    {
+            if (!performUdpHolePunching(tunnel, serverEndpoint))
+            {
+                logMessage(LogLevel::Error, tunnel->tag, "UDP hole punching failed");
+                tunnel->running.store(false, std::memory_order_release);
+            } });
+        holePunchThread.detach();
+
+        logMessage(LogLevel::Info, tunnel->tag,
+                   "UDP hole punch tunnel initiated -> server " + serverEndpoint.display +
+                       ", client_port=" + std::to_string(tunnel->clientPort));
+
+        // Main loop: forward local UDP traffic to server
+        std::vector<char> buffer(kMaxPayloadSize);
+        while (g_running.load(std::memory_order_acquire) && tunnel->running.load(std::memory_order_acquire))
+        {
+            sockaddr_storage peerAddr{};
+            int peerLen = sizeof(peerAddr);
+            const int received = recvfrom(udpSocket, buffer.data(), static_cast<int>(buffer.size()), 0,
+                                          reinterpret_cast<sockaddr *>(&peerAddr), &peerLen);
+            if (received == SOCKET_ERROR)
+            {
+                const int err = WSAGetLastError();
+                if (err == WSAEINTR)
+                {
+                    continue;
+                }
+                if (!g_running.load(std::memory_order_acquire))
+                {
+                    break;
+                }
+                logMessage(LogLevel::Warn, state.logTag,
+                           "recvfrom failed, WSA error=" + std::to_string(err));
+                continue;
+            }
+
+            // Update last local client for response routing
+            {
+                std::lock_guard<std::mutex> lock(tunnel->clientMutex);
+                tunnel->lastLocalClient = peerAddr;
+                tunnel->lastLocalClientLen = peerLen;
+            }
+
+            // Forward data to server if connected
+            if (tunnel->connected.load(std::memory_order_acquire))
+            {
+                tunnel->lastActivity = Clock::now();
+                int sent = sendto(tunnel->clientSocket, buffer.data(), received, 0,
+                                  reinterpret_cast<sockaddr *>(&tunnel->serverAddr), tunnel->serverAddrLen);
+                if (sent == SOCKET_ERROR)
+                {
+                    logMessage(LogLevel::Warn, tunnel->tag, "Failed to forward data to server");
+                }
+            }
+        }
+
+        state.running.store(false, std::memory_order_release);
+
+        // Clean up tunnel
+        if (state.tunnel)
+        {
+            closeUdpHolePunchTunnel(state.tunnel, "Client shutting down");
+        }
+
+        closesocket(udpSocket);
+        logMessage(LogLevel::Info, state.logTag, "UDP hole punching listener stopped");
+    }
+
     BOOL WINAPI consoleHandler(DWORD signal)
     {
         if (signal == CTRL_C_EVENT || signal == CTRL_BREAK_EVENT || signal == CTRL_CLOSE_EVENT)
@@ -862,10 +1420,10 @@ int main()
         configPath = inputPath;
     }
 
-    std::vector<ConfigEntry> configs;
+    Config config;
     try
     {
-        configs = loadConfig(configPath);
+        config = loadConfig(configPath);
     }
     catch (const std::exception &ex)
     {
@@ -918,15 +1476,23 @@ int main()
 
     serverEndpoint.display = '[' + serverAddress + "]:" + std::to_string(serverPortValue);
 
-    logMessage(LogLevel::Info, "[client]", "Loaded " + std::to_string(configs.size()) + " config entries");
+    logMessage(LogLevel::Info, "[client]", "Loaded " + std::to_string(config.entries.size()) + " config entries");
+    logMessage(LogLevel::Info, "[client]", "UDP mode: " + std::string(config.udpOverTcp ? "UDP over TCP" : "UDP hole punching"));
 
     std::vector<std::thread> workers;
-    workers.reserve(configs.size());
-    for (const auto &entry : configs)
+    workers.reserve(config.entries.size());
+    for (const auto &entry : config.entries)
     {
         if (entry.protocol == ProxyProtocol::UDP)
         {
-            workers.emplace_back(runUdpListener, entry, serverEndpoint);
+            if (config.udpOverTcp)
+            {
+                workers.emplace_back(runUdpListener, entry, serverEndpoint);
+            }
+            else
+            {
+                workers.emplace_back(runUdpHolePunchingListener, entry, serverEndpoint);
+            }
         }
         else
         {
