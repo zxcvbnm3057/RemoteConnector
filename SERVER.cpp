@@ -43,7 +43,7 @@
 namespace
 {
     constexpr size_t kMaxPayloadSize = 65535;
-    
+
     // UDP hole punching constants
     constexpr std::chrono::seconds kHolePunchTimeout{30};
     constexpr std::chrono::milliseconds kHandshakeInterval{500};
@@ -366,7 +366,7 @@ namespace
     }
 
     // UDP Hole Punching functions
-    bool sendUdpHolePunchPacket(SOCKET socket, const sockaddr* addr, int addrLen, UdpHolePunchPacketType type, const char* data = nullptr, uint16_t dataLen = 0)
+    bool sendUdpHolePunchPacket(SOCKET socket, const sockaddr *addr, int addrLen, UdpHolePunchPacketType type, const char *data = nullptr, uint16_t dataLen = 0)
     {
         UdpHolePunchPacket packet;
         packet.type = type;
@@ -396,12 +396,11 @@ namespace
     {
         const uint64_t connId = ++g_connectionId;
         std::string remoteTag = "[conn " + std::to_string(connId) + "][" + formatRemote(clientAddr) + "]";
-        
+
         uint16_t targetPort = ntohs(header.target_port);
         uint16_t clientPort = ntohs(header.client_port);
-        
-        logMessage(LogLevel::Info, remoteTag, "UDP hole punching handshake: target_port=" + 
-                   std::to_string(targetPort) + ", client_port=" + std::to_string(clientPort));
+
+        logMessage(LogLevel::Info, remoteTag, "UDP hole punching handshake: target_port=" + std::to_string(targetPort) + ", client_port=" + std::to_string(clientPort));
 
         UdpHolePunchContext context;
         context.targetPort = targetPort;
@@ -411,7 +410,7 @@ namespace
         context.remoteTag = remoteTag;
 
         // Create UDP socket for hole punching
-        context.udpSocket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        context.udpSocket = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP);
         if (context.udpSocket == INVALID_SOCKET)
         {
             logMessage(LogLevel::Error, remoteTag, "Failed to create UDP socket for hole punching");
@@ -423,12 +422,12 @@ namespace
         }
 
         // Bind to random port
-        sockaddr_in serverAddr{};
-        serverAddr.sin_family = AF_INET;
-        serverAddr.sin_addr.s_addr = INADDR_ANY;
-        serverAddr.sin_port = 0; // Let system choose
+        sockaddr_in6 serverAddr{};
+        serverAddr.sin6_family = AF_INET6;
+        serverAddr.sin6_addr = in6addr_any;
+        serverAddr.sin6_port = 0; // Let system choose
 
-        if (bind(context.udpSocket, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR)
+        if (bind(context.udpSocket, reinterpret_cast<sockaddr *>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR)
         {
             logMessage(LogLevel::Error, remoteTag, "Failed to bind UDP socket");
             closesocket(context.udpSocket);
@@ -441,7 +440,7 @@ namespace
 
         // Get assigned port
         int addrLen = sizeof(serverAddr);
-        if (getsockname(context.udpSocket, reinterpret_cast<sockaddr*>(&serverAddr), &addrLen) == SOCKET_ERROR)
+        if (getsockname(context.udpSocket, reinterpret_cast<sockaddr *>(&serverAddr), &addrLen) == SOCKET_ERROR)
         {
             logMessage(LogLevel::Error, remoteTag, "Failed to get server socket port");
             closesocket(context.udpSocket);
@@ -451,17 +450,17 @@ namespace
             sendAll(clientSocket, &response, sizeof(response));
             return;
         }
-        
-        context.serverPort = ntohs(serverAddr.sin_port);
+
+        context.serverPort = ntohs(serverAddr.sin6_port);
 
         // Set client address port for hole punching
         if (clientAddr.ss_family == AF_INET6)
         {
-            reinterpret_cast<sockaddr_in6*>(&context.clientAddr)->sin6_port = htons(clientPort);
+            reinterpret_cast<sockaddr_in6 *>(&context.clientAddr)->sin6_port = htons(clientPort);
         }
         else
         {
-            reinterpret_cast<sockaddr_in*>(&context.clientAddr)->sin_port = htons(clientPort);
+            reinterpret_cast<sockaddr_in *>(&context.clientAddr)->sin_port = htons(clientPort);
         }
 
         // Send response with server port
@@ -489,7 +488,8 @@ namespace
 
         // Start sending handshake packets to client in a separate thread
         // This allows simultaneous sending and receiving for proper hole punching
-        std::thread handshakeSender([&context, remoteTag]() {
+        std::thread handshakeSender([&context, remoteTag]()
+                                    {
             auto handshakeStart = std::chrono::steady_clock::now();
             while (context.running.load(std::memory_order_acquire) && !context.connected.load(std::memory_order_acquire))
             {
@@ -506,8 +506,7 @@ namespace
                                       UdpHolePunchPacketType::HANDSHAKE);
 
                 std::this_thread::sleep_for(kHandshakeInterval);
-            }
-        });
+            } });
 
         // Receive loop for handshake - runs simultaneously with sender
         std::vector<char> buffer(kMaxPayloadSize);
@@ -515,10 +514,10 @@ namespace
         {
             sockaddr_storage fromAddr{};
             int fromLen = sizeof(fromAddr);
-            
+
             int received = recvfrom(context.udpSocket, buffer.data(), static_cast<int>(buffer.size()), 0,
-                                   reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
-            
+                                    reinterpret_cast<sockaddr *>(&fromAddr), &fromLen);
+
             if (received == SOCKET_ERROR)
             {
                 int err = WSAGetLastError();
@@ -538,27 +537,29 @@ namespace
             // Check if this is a handshake packet from client
             if (received >= static_cast<int>(sizeof(UdpHolePunchPacket)))
             {
-                UdpHolePunchPacket* packet = reinterpret_cast<UdpHolePunchPacket*>(buffer.data());
+                UdpHolePunchPacket *packet = reinterpret_cast<UdpHolePunchPacket *>(buffer.data());
                 if (packet->type == UdpHolePunchPacketType::HANDSHAKE)
                 {
-                    logMessage(LogLevel::Info, remoteTag, "UDP hole punching connected");
+                    logMessage(LogLevel::Info, remoteTag,
+                               "UDP hole punching connected (targetPort port " +
+                                   std::to_string(context.targetPort) + ")");
                     context.connected.store(true, std::memory_order_release);
-                    
+
                     // Send ACK
                     sendUdpHolePunchPacket(context.udpSocket,
-                                          reinterpret_cast<sockaddr*>(&fromAddr),
-                                          fromLen,
-                                          UdpHolePunchPacketType::ACK);
+                                           reinterpret_cast<sockaddr *>(&fromAddr),
+                                           fromLen,
+                                           UdpHolePunchPacketType::ACK);
                     break; // Exit handshake receive loop
                 }
             }
         }
 
         // Wait for sender thread to complete
-        if (handshakeSender.joinable())
-        {
-            handshakeSender.join();
-        }
+        // if (handshakeSender.joinable())
+        // {
+        //     handshakeSender.join();
+        // }
 
         if (!context.connected.load(std::memory_order_acquire))
         {
@@ -581,7 +582,7 @@ namespace
         targetAddr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         targetAddr.sin_port = htons(targetPort);
 
-        if (connect(targetSocket, reinterpret_cast<sockaddr*>(&targetAddr), sizeof(targetAddr)) == SOCKET_ERROR)
+        if (connect(targetSocket, reinterpret_cast<sockaddr *>(&targetAddr), sizeof(targetAddr)) == SOCKET_ERROR)
         {
             logMessage(LogLevel::Error, remoteTag, "Failed to connect to target");
             closesocket(targetSocket);
@@ -595,7 +596,8 @@ namespace
         setSocketTimeout(targetSocket, SO_RCVTIMEO, 3000);
 
         // Start forwarding thread for target -> client
-        std::thread targetToClient([&context, targetSocket]() {
+        std::thread targetToClient([&context, targetSocket]()
+                                   {
             std::vector<char> buffer(kMaxPayloadSize);
             while (context.running.load(std::memory_order_acquire))
             {
@@ -630,8 +632,7 @@ namespace
                     break;
                 }
             }
-            context.running.store(false, std::memory_order_release);
-        });
+            context.running.store(false, std::memory_order_release); });
 
         // Main loop: client -> target
         buffer.clear();
@@ -640,10 +641,10 @@ namespace
         {
             sockaddr_storage fromAddr{};
             int fromLen = sizeof(fromAddr);
-            
+
             int received = recvfrom(context.udpSocket, buffer.data(), static_cast<int>(buffer.size()), 0,
-                                   reinterpret_cast<sockaddr*>(&fromAddr), &fromLen);
-            
+                                    reinterpret_cast<sockaddr *>(&fromAddr), &fromLen);
+
             if (received == SOCKET_ERROR)
             {
                 int err = WSAGetLastError();
@@ -670,14 +671,14 @@ namespace
             // Check for heartbeat
             if (received >= static_cast<int>(sizeof(UdpHolePunchPacket)))
             {
-                UdpHolePunchPacket* packet = reinterpret_cast<UdpHolePunchPacket*>(buffer.data());
+                UdpHolePunchPacket *packet = reinterpret_cast<UdpHolePunchPacket *>(buffer.data());
                 if (packet->type == UdpHolePunchPacketType::HEARTBEAT)
                 {
                     // Reply to heartbeat
                     sendUdpHolePunchPacket(context.udpSocket,
-                                          reinterpret_cast<sockaddr*>(&fromAddr),
-                                          fromLen,
-                                          UdpHolePunchPacketType::HEARTBEAT);
+                                           reinterpret_cast<sockaddr *>(&fromAddr),
+                                           fromLen,
+                                           UdpHolePunchPacketType::HEARTBEAT);
                     continue;
                 }
             }
@@ -692,7 +693,7 @@ namespace
         }
 
         context.running.store(false, std::memory_order_release);
-        
+
         if (targetToClient.joinable())
         {
             targetToClient.join();
