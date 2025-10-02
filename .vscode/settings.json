@@ -4,6 +4,7 @@
         "thread": "cpp",
         "xiosbase": "cpp",
         "xlocale": "cpp",
-        "xutility": "cpp"
+        "xutility": "cpp",
+        "mutex": "cpp"
     }
 }

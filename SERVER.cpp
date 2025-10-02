@@ -529,7 +529,6 @@ namespace
                 {
                     logMessage(LogLevel::Warn, remoteTag, "UDP recv failed during handshake, WSA error=" + std::to_string(err));
                 }
-                context.running.store(false, std::memory_order_release);
                 break;
             }
 
@@ -557,7 +556,6 @@ namespace
         }
 
         // Stop the sender thread and wait for it to complete
-        context.running.store(false, std::memory_order_release);
         if (handshakeSender.joinable())
         {
             handshakeSender.join();
